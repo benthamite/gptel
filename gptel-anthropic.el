@@ -126,7 +126,9 @@ information if the stream contains it.  Not my best work, I know."
                 ;; Then shape the tool-use block by adding args so we can call the functions
                 (mapc (lambda (tool-call)
                         (plist-put tool-call :args (plist-get tool-call :input))
-                        (plist-put tool-call :input nil))
+                        (plist-put tool-call :input nil)
+                        (plist-put tool-call :id (gptel--anthropic-unformat-tool-id
+                                                  (plist-get tool-call :id))))
                       tool-use)))
             (when-let* ((response (gptel--json-read)))
               (plist-put info :output-tokens
@@ -170,6 +172,8 @@ Mutate state INFO with response metadata."
       for call = (copy-sequence call-raw) do
       (plist-put call :args (plist-get call :input))
       (plist-put call :input nil)
+      (plist-put call :id (gptel--anthropic-unformat-tool-id
+                           (plist-get call :id)))
       collect call into calls
       finally do (plist-put info :tool-use calls)))
    finally return
@@ -250,7 +254,8 @@ TOOL-USE is a list of plists containing tool names, arguments and call results."
        (let* ((result (plist-get tool-call :result))
               (formatted
                (list :type "tool_result"
-                     :tool_use_id (plist-get tool-call :id)
+                     :tool_use_id (gptel--anthropic-format-tool-id
+                                   (plist-get tool-call :id))
                      :content (if (stringp result) result
                                 (prin1-to-string result)))))
          (prog1 formatted
@@ -261,6 +266,18 @@ TOOL-USE is a list of plists containing tool names, arguments and call results."
 ;; NOTE: No `gptel--inject-prompt' method required for gptel-anthropic, since
 ;; this is handled by its defgeneric implementation
 
+(defun gptel--anthropic-format-tool-id (tool-id)
+  (if (string-prefix-p "toolu_" tool-id)
+      tool-id
+    (format "toolu_%s" tool-id)))
+
+(defun gptel--anthropic-unformat-tool-id (tool-id)
+  (or (and (string-match "toolu_\\(.+\\)" tool-id)
+           (match-string 1 tool-id))
+      (progn
+        (message "Unexpected tool_call_id format: %s" tool-id)
+        tool-id)))
+
 (cl-defmethod gptel--parse-list ((_backend gptel-anthropic) prompt-list)
   (cl-loop for text in prompt-list
            for role = t then (not role)
@@ -268,7 +285,7 @@ TOOL-USE is a list of plists containing tool names, arguments and call results."
            (list :role (if role "user" "assistant")
                  :content `[(:type "text" :text ,text)])))
 
-(cl-defmethod gptel--parse-buffer ((_backend gptel-anthropic) &optional max-entries)
+(cl-defmethod gptel--parse-buffer ((backend gptel-anthropic) &optional max-entries)
   (let ((prompts) (prev-pt (point))
         (include-media (and gptel-track-media (or (gptel--model-capable-p 'media)
                                                   (gptel--model-capable-p 'url)))))
@@ -285,27 +302,48 @@ TOOL-USE is a list of plists containing tool names, arguments and call results."
           (unless (save-excursion (skip-syntax-forward " ") (>= (point) prev-pt))
             (pcase (get-char-property (point) 'gptel)
               ('response
-               (push (list :role "assistant"
-                           :content (buffer-substring-no-properties (point) prev-pt))
-                     prompts))
+               (when-let* ((content
+                            (gptel--trim-prefixes
+                             (buffer-substring-no-properties (point) prev-pt))))
+                 (when (not (string-blank-p content))
+                   (push (list :role "assistant" :content content) prompts))))
+              (`(tool . ,id)
+               (save-excursion
+                 (condition-case nil
+                     (let* ((tool-call (read (current-buffer)))
+                            (id (gptel--anthropic-format-tool-id id))
+                            (name (plist-get tool-call :name))
+                            (arguments (plist-get tool-call :args)))
+                       (plist-put tool-call :id id)
+                       (plist-put tool-call :result
+                                  (string-trim (buffer-substring-no-properties
+                                                (point) prev-pt)))
+                       (push (gptel--parse-tool-results backend (list tool-call))
+                             prompts)
+                       (push (list :role "assistant"
+                                   :content `[( :type "tool_use" :id ,id :name ,name
+                                                :input ,arguments)])
+                             prompts))
+                   ((end-of-file invalid-read-syntax)
+                    (message (format "Could not parse tool-call %s on line %s"
+                                     id (line-number-at-pos (point))))))))
+              ('ignore)
               ('nil                     ; user role: possibly with media
-               (if include-media       
-                   (push (list :role "user"
-                               :content
-                               (gptel--anthropic-parse-multipart
-                                (gptel--parse-media-links major-mode (point) prev-pt)))
-                         prompts)
-                 (push (list :role "user"
-                             :content
-                             (gptel--trim-prefixes
-                              (buffer-substring-no-properties (point) prev-pt)))
-                       prompts)))))
+               (if include-media
+                   (when-let* ((content (gptel--anthropic-parse-multipart
+                                         (gptel--parse-media-links major-mode (point) prev-pt))))
+                     (when (> (length content) 0)
+                       (push (list :role "user" :content content) prompts)))
+                 (when-let* ((content (gptel--trim-prefixes
+                                       (buffer-substring-no-properties (point) prev-pt))))
+                   (push (list :role "user" :content content) prompts))))))
           (setq prev-pt (point))
           (and max-entries (cl-decf max-entries)))
-      (push (list :role "user"
-                  :content
-                  (string-trim (buffer-substring-no-properties (point-min) (point-max))))
-            prompts))
+      (when-let* ((content (string-trim (buffer-substring-no-properties
+                                         (point-min) (point-max)))))
+        ;; XXX fails if content is empty.  The correct error behavior is left to
+        ;; a future discussion.
+        (push (list :role "user" :content content) prompts)))
     prompts))
 
 (defun gptel--anthropic-parse-multipart (parts)
@@ -328,7 +366,7 @@ format."
    for media = (plist-get part :media)
    if text do
    (and (or (= n 1) (= n last)) (setq text (gptel--trim-prefixes text))) and
-   unless (string-empty-p text)
+   if text
    collect `(:type "text" :text ,text) into parts-array end
    else if media
    do

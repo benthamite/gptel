@@ -225,7 +225,7 @@ See generic implementation for full documentation."
            else collect (list :role "model" :parts `(:text ,text)) into prompts
            finally return prompts))
 
-(cl-defmethod gptel--parse-buffer ((_backend gptel-gemini) &optional max-entries)
+(cl-defmethod gptel--parse-buffer ((backend gptel-gemini) &optional max-entries)
   (let ((prompts) (prev-pt (point))
         (include-media (and gptel-track-media (or (gptel--model-capable-p 'media)
                                                   (gptel--model-capable-p 'url)))))
@@ -236,27 +236,44 @@ See generic implementation for full documentation."
                     (not (= (point) prev-pt)))
           (pcase (get-char-property (point) 'gptel)
             ('response
-             (push (list :role "model"
-                         :parts
-                         (list :text (buffer-substring-no-properties (point) prev-pt)))
-                   prompts))
+             (when-let* ((content (gptel--trim-prefixes
+                                   (buffer-substring-no-properties (point) prev-pt))))
+               (push (list :role "model" :parts (list :text content)) prompts)))
+            (`(tool . ,_id)
+             (save-excursion
+               (condition-case nil
+                   (let* ((tool-call (read (current-buffer)))
+                          (name (plist-get tool-call :name))
+                          (arguments  (plist-get tool-call :args)))
+                     (plist-put tool-call :result
+                                (string-trim (buffer-substring-no-properties
+                                              (point) prev-pt)))
+                     (push (gptel--parse-tool-results backend (list tool-call))
+                           prompts)
+                     (push (list :role "model"
+                                 :parts
+                                 (vector `(:functionCall ( :name ,name
+                                                           :args ,arguments))))
+                           prompts))
+                 ((end-of-file invalid-read-syntax)
+                  (message (format "Could not parse tool-call on line %s"
+                                   (line-number-at-pos (point))))))))
+            ('ignore)
             ('nil
              (if include-media
-                 (push (list :role "user"
-                             :parts (gptel--gemini-parse-multipart
-                                     (gptel--parse-media-links major-mode (point) prev-pt)))
-                       prompts)
-               (push (list :role "user"
-                           :parts
-                           `[(:text ,(gptel--trim-prefixes
-                                      (buffer-substring-no-properties (point) prev-pt)))])
-                     prompts))))
+                 (when-let* ((content (gptel--gemini-parse-multipart
+                                       (gptel--parse-media-links major-mode (point) prev-pt))))
+                   (when (> (length content) 0)
+                     (push (list :role "user" :parts content) prompts)))
+               (when-let* ((content (gptel--trim-prefixes
+                                     (buffer-substring-no-properties
+                                      (point) prev-pt))))
+                 (push (list :role "user" :parts `[(:text ,content)]) prompts)))))
           (setq prev-pt (point))
           (and max-entries (cl-decf max-entries)))
-      (push (list :role "user"
-                  :parts
-                  `[(:text ,(string-trim (buffer-substring-no-properties (point-min) (point-max))))])
-            prompts))
+      (let ((content (string-trim (buffer-substring-no-properties
+                                   (point-min) (point-max)))))
+        (push (list :role "user" :parts `[(:text ,content)]) prompts)))
     prompts))
 
 (defun gptel--gemini-parse-multipart (parts)
@@ -277,7 +294,7 @@ format."
    for media = (plist-get part :media)
    if text do
    (and (or (= n 1) (= n last)) (setq text (gptel--trim-prefixes text))) and
-   unless (string-empty-p text)
+   if text
    collect (list :text text) into parts-array end
    else if media
    collect
