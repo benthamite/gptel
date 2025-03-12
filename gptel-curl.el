@@ -258,6 +258,8 @@ Optional RAW disables text properties and transformation."
            ;; (run-hooks 'gptel-pre-stream-hook)
            (insert response)
            (run-hooks 'gptel-post-stream-hook)))))
+    (`(reasoning . ,text)
+     (gptel--display-reasoning-stream text info))
     (`(tool-call . ,tool-calls)
      (gptel--display-tool-calls tool-calls info))
     (`(tool-result . ,tool-results)
@@ -265,7 +267,9 @@ Optional RAW disables text properties and transformation."
 
 (defun gptel-curl--stream-filter (process output)
   (let* ((fsm (alist-get process gptel--request-alist))
-         (proc-info (gptel-fsm-info fsm)))
+         (proc-info (gptel-fsm-info fsm))
+         (callback (or (plist-get proc-info :callback)
+                       #'gptel-curl--stream-insert-response)))
     (with-current-buffer (process-buffer process)
       ;; Insert output
       (save-excursion
@@ -292,13 +296,58 @@ Optional RAW disables text properties and transformation."
                   (http-status (plist-get proc-info :http-status)))
         ;; Find data chunk(s) and run callback
         ;; FIXME Handle the case where HTTP 100 is followed by HTTP (not 200) BUG #194
-        (when-let* (((member http-status '("200" "100")))
-                    (response ;; (funcall (plist-get proc-info :parser) nil proc-info)
-                     (gptel-curl--parse-stream (plist-get proc-info :backend) proc-info))
-                    ((not (equal response ""))))
-          (funcall (or (plist-get proc-info :callback)
-                       #'gptel-curl--stream-insert-response)
-                   response proc-info))))))
+        (when (member http-status '("200" "100"))
+          (let ((response (gptel-curl--parse-stream
+                           (plist-get proc-info :backend) proc-info))
+                (reasoning-block (plist-get proc-info :reasoning-block)))
+            ;; Depending on the API, there are two modes that reasoning or
+            ;; chain-of-thought content appears: as part of the main response
+            ;; but surrounded by <think>...</think> tags, or as a separate
+            ;; JSON field in the response stream.
+            ;;
+            ;; These cases are handled using two PROC-INFO keys:
+            ;;
+            ;; :reasoning-block is nil before checking for reasoning, 'in when
+            ;; in a reasoning block, t when we reach the end of the block, and
+            ;; 'done afterwards or if no reasoning block is found.  This
+            ;; applies to both the modes above.
+            ;;
+            ;; :reasoning contains the reasoning text parsed from the separate
+            ;; JSON field.
+            ;;
+            ;; NOTE: We assume here that the reasoning block always
+            ;; precedes the main response block.
+            (unless (eq reasoning-block 'done)
+              (let ((reasoning (plist-get proc-info :reasoning)))
+                (cond
+                 ((stringp reasoning)
+                  ;; Obtained from separate JSON field in response
+                  (funcall callback (cons 'reasoning reasoning) proc-info)
+                  (plist-put proc-info :reasoning nil)) ;Reset for next parsing round
+                 ((and (null reasoning-block) (length> response 0))
+                  (if (string-match-p "^ *<think>" response)
+                      ;; Obtained from main response stream
+                      (progn (setq response (cons 'reasoning response))
+                             (plist-put proc-info :reasoning-block 'in))
+                    (plist-put proc-info :reasoning-block 'done)))
+                 ((length> response 0)
+                  (if-let* ((idx (string-match-p "</think>" response)))
+                      (progn
+                        (funcall callback
+                                 (cons 'reasoning ;last reasoning chunk
+                                       (string-trim-left
+                                        (substring response nil (+ idx 8))))
+                                 proc-info)
+                        ;; Signal end of reasoning stream
+                        (funcall callback '(reasoning . t) proc-info)
+                        (setq response (substring response (+ idx 8)))
+                        (plist-put proc-info :reasoning-block 'done))
+                    (setq response (cons 'reasoning response)))))
+                (when (eq reasoning-block t) ;End of reasoning block
+                  (funcall callback '(reasoning . t) proc-info)
+                  (plist-put proc-info :reasoning-block 'done))))
+            (unless (equal response "") ;Response callback
+              (funcall callback response proc-info))))))))
 
 (cl-defgeneric gptel-curl--parse-stream (backend proc-info)
   "Stream parser for gptel-curl.
@@ -329,6 +378,18 @@ PROCESS and _STATUS are process parameters."
         (plist-put proc-info :status http-msg)
         (gptel--fsm-transition fsm)     ;WAIT -> TYPE
         (when error (plist-put proc-info :error error))
+        (when response                  ;Look for a reasoning block
+          (if (string-match-p "^ *<think>\n" response)
+              (when-let* ((idx (string-search "</think>\n" response)))
+                (with-demoted-errors "gptel callback error: %S"
+                  (funcall proc-callback
+                           (cons 'reasoning (substring response nil (+ idx 8)))
+                           proc-info))
+                (setq response
+                      (string-trim-left (substring response (+ idx 8)))))
+            (when-let* ((reasoning (plist-get proc-info :reasoning))
+                        ((stringp reasoning)))
+              (funcall proc-callback (cons 'reasoning reasoning) proc-info))))
         (when (or response (not (member http-status '("200" "100"))))
           (with-demoted-errors "gptel callback error: %S"
             (funcall proc-callback response proc-info))))

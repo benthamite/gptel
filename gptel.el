@@ -191,9 +191,6 @@
 (require 'cl-generic)
 (require 'gptel-openai)
 
-(with-eval-after-load 'org
-  (require 'gptel-org))
-
 
 ;;; User options
 
@@ -272,6 +269,19 @@ if the command-line argument size is limited by the operating system.
 The default for windows comes from Microsoft documentation located here:
 https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessa"
   :type 'natnum)
+
+(defcustom gptel-prompt-filter-hook nil
+  "Hook run to modify the buffer before sending.
+
+This hook is called in a temporary buffer containing the text to
+be sent, with the cursor at the end of the prompt.  You can use
+it to modify the buffer as required.
+
+Example: A typical use case might be to search for occurrences of
+$(cmd) and replace it with the output of the shell command cmd,
+making it easy to send the output of shell commands to the LLM."
+  :group 'gptel
+  :type 'hook)
 
 (defcustom gptel-post-request-hook nil
   "Hook run after sending a gptel request.
@@ -478,6 +488,40 @@ To set the temperature for a chat session interactively call
 `gptel-send' with a prefix argument."
   :safe #'always
   :type 'number)
+
+(defcustom gptel-cache nil
+  "Whether the LLM should cache request content.
+
+Some LLM backends can cache content sent to it by gptel, so that
+only the newly included part of the text needs to be processed on
+subsequent conversation turns.  This results in faster and
+significantly cheaper processing.
+
+NOTE: Manual or client-configurable caching is currently
+supported only by the Anthropic API and thus the
+`gptel-anthropic' backend.  This variable has no effect on the
+behavior of other backends.
+
+This variable controls which parts of the query will be cached,
+and can be the symbols t or nil to cache everything or nothing
+respectively. It can also be a list of symbols:
+
+- message: Cache conversation messages
+- system: Cache the system message
+- tool: Cache tool definitions
+
+Examples:
+
+Setting it to (message system) will cache the system message and
+the conversation text.
+
+Setting it to (message system tool) will cache everything and is
+the same as t."
+  :type '(choice
+          (const :tag "Cache everything" t)
+          (const :tag "Do not cache" nil)
+          (repeat symbol))
+  :group 'gptel)
 
 (defvar gptel--known-backends)
 
@@ -775,6 +819,29 @@ Currently supported options are:
           (const :tag "With system message" system)
           (const :tag "With user prompt" user)))
 
+(defcustom gptel-include-reasoning t
+  "How to handle LLM reasoning or \"thinking\" text blocks.
+
+Some LLMs include in their response a \"thinking\" section.  This
+text improves the quality of the LLM's final output, but may not
+be interesting to you by itself.
+
+Supported options are the symbols
+
+    t       - Include with the response, the default
+    nil     - Do not include
+    ignore  - Include with the response but ignore on subsequent
+              conversation turns
+
+It can also be a string naming a buffer, in which case the
+reasoning text will be inserted at the end of that buffer."
+  :group 'gptel
+  :type '(choice
+          (const :tag "Include with response" t)
+          (const :tag "Don't include" nil)
+          (const :tag "Include but ignore" ignore)
+          (string :tag "Include in buffer")))
+
 (defvar-local gptel--old-header-line nil)
 
 (defvar gptel-context--alist nil
@@ -852,12 +919,6 @@ Later plists in the sequence take precedence over earlier ones."
         (setq rtn (plist-put rtn p v))))
     rtn))
 
-(defun gptel--font-lock-update (beg end)
-  "Force font-lock update between BEG and END."
-  (when font-lock-mode
-    (save-excursion
-      (font-lock-fontify-region beg end))))
-
 (defun gptel-auto-scroll ()
   "Scroll window if LLM response continues below viewport.
 
@@ -903,6 +964,22 @@ Note: This will move the cursor."
   `(save-excursion
      (skip-syntax-forward "w.")
      ,(macroexp-progn body)))
+
+(defmacro gptel--with-buffer-copy (buf start end &rest body)
+  "Copy gptel's local variables from BUF to a temp buffer and run BODY.
+
+If positions START and END are provided, insert that part of BUF first."
+  (declare (indent 3))
+  `(with-temp-buffer
+     (dolist (sym '( gptel-backend gptel--system-message gptel-model
+                     gptel-mode gptel-track-response gptel-track-media
+                     gptel-prompt-filter-hook))
+      (set (make-local-variable sym)
+       (buffer-local-value sym ,buf)))
+     ,(when (and start end)
+       `(insert-buffer-substring ,buf ,start ,end))
+     (let ((major-mode (buffer-local-value 'major-mode ,buf)))
+      ,@body)))
 
 (defun gptel-prompt-prefix-string ()
   "Prefix before user prompts in `gptel-mode'."
@@ -1254,7 +1331,7 @@ file."
         (add-hook 'before-save-hook #'gptel--save-state nil t)
         (when (derived-mode-p 'org-mode)
           ;; Work around bug in `org-fontify-extend-region'.
-          (add-hook 'gptel-post-response-functions #'gptel--font-lock-update nil t))
+          (add-hook 'gptel-post-response-functions #'font-lock-flush nil t))
         (gptel--restore-state)
         (if gptel-use-header-line
           (setq gptel--old-header-line header-line-format
@@ -2093,21 +2170,38 @@ RESPONSE is
 - nil if there was no response or an error.
 
 These are the only two cases you typically need to consider,
-unless you need to clean up after aborted requests, use LLM tools
-or streaming responses (see STREAM).  In these cases, RESPONSE
-can be
+unless you need to clean up after aborted requests, use LLM
+tools, handle \"reasoning\" content specially or stream
+responses (see STREAM).  In these cases, RESPONSE can be
 
 - The symbol `abort' if the request is aborted, see `gptel-abort'.
 
-- A list beginning with `tool-call'.  The cdr form is (TOOL ARGS
-  CALLBACK) ...) where TOOL is a gptel-tool struct, ARGS is a plist of
-  arguments, and CALLBACK is a function for handling the results.
+- A cons cell of the form
 
-- A list beginning with `tool-result'.  The cdr form is ((TOOL ARGS
-  RESULT) ...) where TOOL is a gptel-tool struct, ARGS is a plist of
-  arguments, and RESULT was returned from calling the tool function.
+  (tool-call . ((TOOL ARGS CB) ...))
 
-See `gptel--insert-response' for an example callback handling all cases.
+  where TOOL is a gptel-tool struct, ARGS is a plist of
+  arguments, and CB is a function for handling the results.  You
+  can call CB with the result of calling the tool to continue the
+  request.
+
+- A cons cell of the form
+
+  (tool-result . ((TOOL ARGS RESULT) ...))
+
+  where TOOL is a gptel-tool struct, ARGS is a plist of
+  arguments, and RESULT was returned from calling the tool
+  function.
+
+- A cons cell of the form
+
+  (reasoning . text)
+
+  where text is the contents of the reasoning block.  (Also see
+  STREAM if you are using streaming.)
+
+See `gptel--insert-response' for an example callback handling all
+cases.
 
 STREAM is a boolean that determines if the response should be
 streamed, as in `gptel-stream'.  If the model or the backend does
@@ -2119,6 +2213,9 @@ When streaming responses
   chunk (a string) as it is received.
 - When the HTTP request ends successfully, CALLBACK will be
   called with a RESPONSE argument of t to indicate success.
+- Similarly, CALLBACK will be called with
+  (reasoning . text-chunk) for each reasoning chunk, and
+  (reasoning . t) to indicate the end of the reasoning block.
 
 The INFO plist has (at least) the following keys:
 :data         - The request data included with the query
@@ -2238,12 +2335,13 @@ be used to rerun or continue the request at a later time."
             ((null prompt)
              (gptel--create-prompt start-marker))
             ((stringp prompt)
-             ;; FIXME Dear reader, welcome to Jank City:
-             (with-temp-buffer
-               (let ((gptel-model (buffer-local-value 'gptel-model buffer))
-                     (gptel-backend (buffer-local-value 'gptel-backend buffer)))
-                 (insert prompt)
-                 (gptel--create-prompt))))
+             (gptel--with-buffer-copy buffer nil nil
+               (insert prompt)
+               (save-excursion (run-hooks 'gptel-prompt-filter-hook))
+               (gptel--wrap-user-prompt-maybe
+                (gptel--parse-buffer
+                 gptel-backend (and gptel--num-messages-to-send
+                                    (* 2 gptel--num-messages-to-send))))))
             ((consp prompt) (gptel--parse-list gptel-backend prompt)))))
          (info (list :data (gptel--request-data gptel-backend full-prompt)
                      :buffer buffer
@@ -2254,6 +2352,8 @@ be used to rerun or continue the request at a later time."
     (when callback (plist-put info :callback callback))
     (when context (plist-put info :context context))
     (when in-place (plist-put info :in-place in-place))
+    (when gptel-include-reasoning       ;Required for next-request-only scope
+      (plist-put info :include-reasoning gptel-include-reasoning))
     (when (and gptel-use-tools gptel-tools)
       (plist-put info :tools gptel-tools))
     ;; Add info to state machine context
@@ -2419,10 +2519,62 @@ Optional RAW disables text properties and transformation."
              (plist-put info :tracking-marker (setq tracking-marker (point-marker)))
              ;; for uniformity with streaming responses
              (set-marker-insertion-type tracking-marker t)))))
+      (`(reasoning . ,text)
+       (when-let* ((include (plist-get info :include-reasoning)))
+         (if (stringp include)
+             (with-current-buffer (get-buffer-create
+                                   (plist-get info :include-reasoning))
+               (save-excursion (goto-char (point-max)) (insert text)))
+           (with-current-buffer (marker-buffer start-marker)
+             (let ((blocks (if (derived-mode-p 'org-mode)
+                               `("#+begin_reasoning\n" . ,(concat "\n#+end_reasoning"
+                                                           gptel-response-separator))
+                             ;; TODO(reasoning) remove properties and strip instead
+                             (cons (propertize "``` reasoning\n" 'gptel 'ignore)
+                                   (concat (propertize "\n```" 'gptel 'ignore)
+                                           gptel-response-separator)))))
+               (if (eq include 'ignore)
+                   (progn
+                     (add-text-properties
+                      0 (length text) '(gptel ignore front-sticky (gptel)) text)
+                     (gptel--insert-response
+                      (concat (car blocks) text (cdr blocks)) info t))
+                 (gptel--insert-response (car blocks) info t)
+                 (gptel--insert-response text info)
+                 (gptel--insert-response (cdr blocks) info t))
+               (when (derived-mode-p 'org-mode) ;fold block
+                 (save-excursion
+                   (goto-char (plist-get info :tracking-marker))
+                   (search-backward "#+end_reasoning" start-marker t)
+                   (when (looking-at "^#\\+end_reasoning")
+                     (org-cycle)))))))))
       (`(tool-call . ,tool-calls)
        (gptel--display-tool-calls tool-calls info))
       (`(tool-result . ,tool-results)
        (gptel--display-tool-results tool-results info)))))
+
+(defun gptel--wrap-user-prompt-maybe (prompts)
+  "Return PROMPTS wrapped with text and media context.
+
+This delegates to backend-specific wrap functions."
+  (prog1 prompts
+    (when gptel-context--alist
+      ;; Inject context chunks into the last user prompt if required.
+      ;; This is also the fallback for when `gptel-use-context' is set to
+      ;; 'system but the model does not support system messages.
+      (when (and gptel-use-context
+                 (or (eq gptel-use-context 'user)
+                     (gptel--model-capable-p 'nosystem))
+                 (> (length prompts) 0)) ;FIXME context should be injected
+                                        ;even when there are no prompts
+        (gptel--wrap-user-prompt gptel-backend prompts))
+      ;; Inject media chunks into the first user prompt if required.  Media
+      ;; chunks are always included with the first user message,
+      ;; irrespective of the preference in `gptel-use-context'.  This is
+      ;; because media cannot be included (in general) with system messages.
+      (when (and gptel-use-context gptel-track-media
+                 (gptel--model-capable-p 'media))
+        (gptel--wrap-user-prompt gptel-backend prompts :media)))))
 
 (defun gptel--create-prompt (&optional prompt-end)
   "Return a full conversation prompt from the contents of this buffer.
@@ -2443,38 +2595,23 @@ there."
       (let* ((max-entries (and gptel--num-messages-to-send
                                (* 2 gptel--num-messages-to-send)))
              (prompt-end (or prompt-end (point-max)))
+             (buf (current-buffer))
              (prompts
               (cond
                ((use-region-p)
-                ;; Narrow to region
-                (narrow-to-region (region-beginning) (region-end))
-                (goto-char (point-max))
-                (gptel--parse-buffer gptel-backend max-entries))
+                (let ((rb (region-beginning)) (re (region-end)))
+                  (gptel--with-buffer-copy buf rb re
+                    (save-excursion (run-hooks 'gptel-prompt-filter-hook))
+                    (gptel--parse-buffer gptel-backend max-entries))))
                ((derived-mode-p 'org-mode)
                 (require 'gptel-org)
                 (goto-char prompt-end)
                 (gptel-org--create-prompt prompt-end))
-               (t (goto-char prompt-end)
-                  (gptel--parse-buffer gptel-backend max-entries)))))
+               (t (gptel--with-buffer-copy buf (point-min) prompt-end
+                    (save-excursion (run-hooks 'gptel-prompt-filter-hook))
+                    (gptel--parse-buffer gptel-backend max-entries))))))
         ;; NOTE: prompts is modified in place here
-        (when gptel-context--alist
-          ;; Inject context chunks into the last user prompt if required.
-          ;; This is also the fallback for when `gptel-use-context' is set to
-          ;; 'system but the model does not support system messages.
-          (when (and gptel-use-context
-                     (or (eq gptel-use-context 'user)
-                         (gptel--model-capable-p 'nosystem))
-                     (> (length prompts) 0)) ;FIXME context should be injected
-                                             ;even when there are no prompts
-            (gptel--wrap-user-prompt gptel-backend prompts))
-          ;; Inject media chunks into the first user prompt if required.  Media
-          ;; chunks are always included with the first user message,
-          ;; irrespective of the preference in `gptel-use-context'.  This is
-          ;; because media cannot be included (in general) with system messages.
-          (when (and gptel-use-context gptel-track-media
-                     (gptel--model-capable-p 'media))
-            (gptel--wrap-user-prompt gptel-backend prompts :media)))
-        prompts))))
+        (gptel--wrap-user-prompt-maybe prompts)))))
 
 (cl-defgeneric gptel--parse-buffer (backend max-entries)
   "Parse current buffer backwards from point and return a list of prompts.
@@ -2627,6 +2764,19 @@ the response is inserted into the current buffer after point."
                              (plist-put info :status http-msg)
                              (gptel--fsm-transition fsm) ;WAIT -> TYPE
                              (when error (plist-put info :error error))
+                             (when response ;Look for a reasoning block
+                               (if (string-match-p "^ *<think>\n" response)
+                                   (when-let* ((idx (string-search "</think>\n" response)))
+                                     (with-demoted-errors "gptel callback error: %S"
+                                       (funcall callback
+                                                (cons 'reasoning
+                                                      (substring response nil (+ idx 8)))
+                                                info))
+                                     (setq response (string-trim-left
+                                                     (substring response (+ idx 8)))))
+                                 (when-let* ((reasoning (plist-get info :reasoning))
+                                             ((stringp reasoning)))
+                                   (funcall callback (cons 'reasoning reasoning) info))))
                              (when (or response (not (member http-status '("200" "100"))))
                                (with-demoted-errors "gptel callback error: %S"
                                  (funcall callback response info)))
@@ -2762,6 +2912,61 @@ INTERACTIVEP is t when gptel is called interactively."
       (message "Send your query with %s!"
                (substitute-command-keys "\\[gptel-send]")))
     (current-buffer)))
+
+
+;;; Reasoning content UI
+(declare-function gptel-curl--stream-insert-response "gptel-curl")
+
+(defun gptel--display-reasoning-stream (text info)
+  "Show reasoning TEXT in an appropriate location.
+
+INFO is the request INFO, see `gptel--url-get-response'.  This is
+for streaming responses only."
+  (when-let* ((include (plist-get info :include-reasoning)))
+    (if (stringp include)
+        (unless (eq text t)
+          (with-current-buffer (get-buffer-create include)
+            (save-excursion (goto-char (point-max))
+                            (insert text))))
+      (let* ((reasoning-marker (plist-get info :reasoning-marker))
+             (tracking-marker (plist-get info :tracking-marker))
+             (start-marker (plist-get info :position)))
+        (with-current-buffer (marker-buffer start-marker)
+          (if (eq text t)               ;end of stream
+              (progn
+                (gptel-curl--stream-insert-response
+                 (concat (if (derived-mode-p 'org-mode)
+                             "\n#+end_reasoning"
+                           ;; TODO(reasoning) remove properties and strip instead
+                           (propertize "\n```" 'gptel 'ignore))
+                         gptel-response-separator)
+                 info t)
+                (when (derived-mode-p 'org-mode) ;fold block
+                  (ignore-errors
+                    (save-excursion
+                      (goto-char tracking-marker)
+                      (search-backward "#+end_reasoning" start-marker t)
+                      (when (looking-at "^#\\+end_reasoning")
+                        (org-cycle))))))
+            (unless (and reasoning-marker tracking-marker
+                         (= reasoning-marker tracking-marker))
+              (gptel-curl--stream-insert-response
+               (if (derived-mode-p 'org-mode)
+                   "#+begin_reasoning\n"
+                 ;; TODO(reasoning) remove properties and strip instead
+                 (propertize "``` reasoning\n" 'gptel 'ignore))
+               info t))
+            (if (eq include 'ignore)
+                (progn
+                  (add-text-properties
+                   0 (length text) '(gptel ignore front-sticky (gptel)) text)
+                  (gptel-curl--stream-insert-response text info t))
+              (gptel-curl--stream-insert-response text info)))
+          (setq tracking-marker (plist-get info :tracking-marker))
+          (if reasoning-marker
+              (move-marker reasoning-marker tracking-marker)
+            (plist-put info :reasoning-marker
+                       (copy-marker tracking-marker nil))))))))
 
 
 ;;; Tool use UI
